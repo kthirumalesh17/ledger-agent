@@ -1,163 +1,172 @@
-import json, os, re
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+import json, os, re, sqlite3
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Load data
-DATA_PATH = os.path.join(os.path.dirname(__file__), "orders.json")
-with open(DATA_PATH) as f:
-    RAW_ORDERS = json.load(f)
-
 # Currency rates
 USD_PER = {"USD": 1.0, "EUR": 1.12, "INR": 0.01209}
 
-IST = ZoneInfo("Asia/Kolkata")
+# Load JSONL data and build SQLite DB
+DATA_PATH = os.path.join(os.path.dirname(__file__), "orders.jsonl")
 
-def parse_dt(s):
-    s = s.strip()
-    # Handle +05:30 offset
-    try:
-        return datetime.fromisoformat(s).astimezone(IST)
-    except:
-        return None
+db = sqlite3.connect(":memory:", check_same_thread=False)
 
-def to_usd(amount, currency):
-    return amount * USD_PER.get(currency, 1.0)
+def init_db():
+    rows = []
+    with open(DATA_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
 
-# Deduplicate: keep latest updated_at per order id
-def deduplicate(orders):
+    # Deduplicate - keep latest updated_at per id
     latest = {}
-    for o in orders:
-        oid = o['id']
-        if oid not in latest:
-            latest[oid] = o
-        else:
-            existing_dt = parse_dt(latest[oid]['updated_at'])
-            new_dt = parse_dt(o['updated_at'])
-            if new_dt and existing_dt and new_dt > existing_dt:
-                latest[oid] = o
-    return list(latest.values())
+    for r in rows:
+        oid = r['id']
+        if oid not in latest or r['updated_at'] > latest[oid]['updated_at']:
+            latest[oid] = r
+    rows = list(latest.values())
 
-ORDERS = deduplicate(RAW_ORDERS)
+    db.execute("""CREATE TABLE orders (
+        id TEXT, customer TEXT, region TEXT, product TEXT,
+        qty INTEGER, unit_price REAL, amount REAL, currency TEXT,
+        status TEXT, created_at TEXT, updated_at TEXT,
+        amount_usd REAL, created_month TEXT, created_year INTEGER
+    )""")
 
-class QuestionRequest(BaseModel):
-    question: str
-
-def extract_month_year(question):
-    months = {
-        'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
-        'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
-        'january': 1, 'february': 2, 'march': 3, 'april': 4,
-        'june': 6, 'july': 7, 'august': 8, 'september': 9,
-        'october': 10, 'november': 11, 'december': 12
-    }
-    q = question.lower()
-    found_month = None
-    found_year = None
-    for name, num in months.items():
-        if name in q:
-            found_month = num
-            break
-    year_match = re.search(r'\b(202\d)\b', q)
-    if year_match:
-        found_year = int(year_match.group(1))
-    return found_month, found_year
-
-def answer_question(question):
-    q = question.lower()
-    
-    # Extract filters
-    month, year = extract_month_year(question)
-    
-    # Region
-    region = None
-    for r in ['north', 'south', 'east', 'west', 'central']:
-        if r in q:
-            region = r.capitalize()
-            break
-    
-    # Product
-    products_list = ['toaster', 'grinder', 'kettle', 'blender', 'mixer', 'rice cooker', 'juicer', 'air fryer']
-    product = None
-    for p in products_list:
-        if p in q:
-            product = p.title()
-            break
-    
-    # Customer
-    cust_match = re.search(r'c\d+', q)
-    customer = cust_match.group(0).upper() if cust_match else None
-    
-    # Filter orders
-    def matches(o):
-        if 'refund' in q or 'refunded' in q:
-            if o['status'] != 'refunded':
-                return False
-        elif 'revenue' in q or 'total' in q or 'paid' in q or 'sale' in q or 'sold' in q or 'earn' in q:
-            if o['status'] != 'paid':
-                return False
-        
-        if month or year:
-            dt = parse_dt(o['created_at'])
-            if dt:
-                if month and dt.month != month:
-                    return False
-                if year and dt.year != year:
-                    return False
+    for r in rows:
+        rate = USD_PER.get(r.get('currency', 'USD'), 1.0)
+        amount_usd = r['amount'] * rate
+        # Parse date in IST
+        ca = r['created_at']
+        # Convert to IST: handle +05:30 or Z
+        from datetime import datetime, timezone, timedelta
+        IST = timezone(timedelta(hours=5, minutes=30))
+        try:
+            if ca.endswith('Z'):
+                dt = datetime.fromisoformat(ca.replace('Z', '+00:00')).astimezone(IST)
             else:
-                return False
-        
-        if region and o['region'] != region:
-            return False
-        if product and o['product'] != product:
-            return False
-        if customer and o['customer'].upper() != customer:
-            return False
-        
-        return True
-    
-    filtered = [o for o in ORDERS if matches(o)]
-    
-    # What to compute
-    if 'how many' in q and ('order' in q or 'transaction' in q):
-        return len(filtered)
-    
-    if 'how many' in q and 'customer' in q:
-        return len(set(o['customer'] for o in filtered))
-    
-    if 'how many' in q and 'product' in q:
-        return len(set(o['product'] for o in filtered))
-    
-    if 'quantity' in q or 'units sold' in q or 'qty' in q or 'how many units' in q:
-        return sum(o['qty'] for o in filtered)
-    
-    if 'average' in q and 'order' in q:
-        if not filtered:
-            return 0
-        total = sum(to_usd(o['amount'], o.get('currency','USD')) for o in filtered)
-        return round(total / len(filtered), 2)
-    
-    if 'refund' in q:
-        total = sum(to_usd(o['amount'], o.get('currency','USD')) for o in filtered)
-        return round(total, 2)
-    
-    # Default: revenue (sum of paid orders in USD)
-    total = sum(to_usd(o['amount'], o.get('currency','USD')) for o in filtered)
-    return round(total, 2)
+                dt = datetime.fromisoformat(ca).astimezone(IST)
+            created_month = dt.strftime('%Y-%m')
+            created_year = dt.year
+        except:
+            created_month = ca[:7]
+            created_year = int(ca[:4])
+
+        db.execute("INSERT INTO orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            r['id'], r['customer'], r['region'], r['product'],
+            r['qty'], r['unit_price'], r['amount'], r.get('currency','USD'),
+            r['status'], r['created_at'], r['updated_at'],
+            amount_usd, created_month, created_year
+        ))
+    db.commit()
+    print(f"Loaded {len(rows)} deduplicated orders into SQLite")
+
+init_db()
+
+MONTH_MAP = {
+    'january':'01','february':'02','march':'03','april':'04',
+    'may':'05','june':'06','july':'07','august':'08',
+    'september':'09','october':'10','november':'11','december':'12',
+    'jan':'01','feb':'02','mar':'03','apr':'04',
+    'jun':'06','jul':'07','aug':'08','sep':'09','oct':'10','nov':'11','dec':'12'
+}
+PRODUCTS = ['Air Fryer','Rice Cooker','Juicer','Toaster','Mixer','Kettle','Blender','Grinder']
+REGIONS = ['North','South','East','West','Central']
+
+def parse_to_sql(question):
+    q = question.lower()
+    conditions = []
+
+    # Status
+    if re.search(r'\brefund(ed|s)?\b', q):
+        conditions.append("status = 'refunded'")
+    elif re.search(r'\b(void|voided|cancel)\b', q):
+        conditions.append("status = 'void'")
+    else:
+        conditions.append("status = 'paid'")
+
+    # Region
+    for reg in REGIONS:
+        if re.search(rf'\b{reg.lower()}\b', q):
+            conditions.append(f"region = '{reg}'")
+            break
+
+    # Product
+    for prod in PRODUCTS:
+        if re.search(rf'\b{re.escape(prod.lower())}s?\b', q):
+            conditions.append(f"product = '{prod}'")
+            break
+
+    # Customer
+    cm = re.search(r'\b(c\d{4})\b', q)
+    if cm:
+        conditions.append(f"customer = '{cm.group(1).upper()}'")
+
+    # Date
+    ym = re.search(r'\b(202\d)\b', q)
+    year_str = ym.group(1) if ym else None
+
+    month_num = None
+    for m_name, m_val in MONTH_MAP.items():
+        if re.search(rf'\b{m_name}\b', q):
+            month_num = m_val
+            break
+
+    if month_num and year_str:
+        conditions.append(f"created_month = '{year_str}-{month_num}'")
+    elif month_num:
+        conditions.append(f"substr(created_month, 6, 2) = '{month_num}'")
+    elif year_str:
+        conditions.append(f"created_year = {year_str}")
+
+    where = ' AND '.join(conditions) if conditions else '1=1'
+
+    # Intent
+    if re.search(r'\b(which|top|best).*(product)\b', q) or re.search(r'\bproduct.*(most|top|highest)\b', q):
+        metric = 'SUM(qty)' if re.search(r'\b(qty|quantity|units)\b', q) else 'SUM(amount_usd)'
+        return f"SELECT product FROM orders WHERE {where} GROUP BY product ORDER BY {metric} DESC LIMIT 1", 'string'
+
+    if re.search(r'\b(which|top|best).*(customer)\b', q) or re.search(r'\bcustomer.*(most|top|highest)\b', q):
+        return f"SELECT customer FROM orders WHERE {where} GROUP BY customer ORDER BY SUM(amount_usd) DESC LIMIT 1", 'string'
+
+    if re.search(r'\b(which|top|best).*(region)\b', q) or re.search(r'\bregion.*(most|top|highest)\b', q):
+        return f"SELECT region FROM orders WHERE {where} GROUP BY region ORDER BY SUM(amount_usd) DESC LIMIT 1", 'string'
+
+    if re.search(r'\b(distinct|unique|different|how many).*(customer)\b', q):
+        return f"SELECT COUNT(DISTINCT customer) FROM orders WHERE {where}", 'int'
+
+    if re.search(r'\baverage\b', q):
+        return f"SELECT ROUND(COALESCE(AVG(amount_usd),0),2) FROM orders WHERE {where}", 'money'
+
+    if re.search(r'\b(how many orders|number of orders|count.*orders)\b', q):
+        return f"SELECT COUNT(*) FROM orders WHERE {where}", 'int'
+
+    if re.search(r'\b(how many units|total quantity|total units|units sold)\b', q):
+        return f"SELECT COALESCE(SUM(qty),0) FROM orders WHERE {where}", 'int'
+
+    # Default: revenue
+    return f"SELECT ROUND(COALESCE(SUM(amount_usd),0),2) FROM orders WHERE {where}", 'money'
+
+class Req(BaseModel):
+    question: str
 
 @app.post("/")
 @app.post("/api")
-async def handle(req: QuestionRequest):
-    try:
-        ans = answer_question(req.question)
-        return JSONResponse(content={"answer": ans}, headers={
-            "Access-Control-Allow-Origin": "*"
-        })
-    except Exception as e:
-        return JSONResponse(content={"answer": str(e)}, status_code=500)
+def answer(req: Req):
+    sql, typ = parse_to_sql(req.question)
+    print(f"Q: {req.question}\nSQL: {sql}")
+    cur = db.execute(sql)
+    row = cur.fetchone()
+    val = row[0] if row and row[0] is not None else 0
+    if typ == 'string':
+        result = str(val)
+    elif typ == 'int':
+        result = int(val)
+    else:
+        result = round(float(val), 2)
+    print(f"A: {result}")
+    return {"answer": result}
