@@ -1,5 +1,5 @@
 import json, os, re, sqlite3
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -154,11 +154,9 @@ def parse_to_sql(question):
 class Req(BaseModel):
     question: str
 
-@app.post("/")
-@app.post("/api")
-def answer(req: Req):
-    sql, typ = parse_to_sql(req.question)
-    print(f"Q: {req.question}\nSQL: {sql}")
+def get_answer(question: str):
+    sql, typ = parse_to_sql(question)
+    print(f"Q: {question}\nSQL: {sql}")
     cur = db.execute(sql)
     row = cur.fetchone()
     val = row[0] if row and row[0] is not None else 0
@@ -169,4 +167,59 @@ def answer(req: Req):
     else:
         result = round(float(val), 2)
     print(f"A: {result}")
+    return result
+
+@app.post("/")
+@app.post("/api")
+async def answer(request: Request):
+    from fastapi import Request as Req2
+    body = await request.json()
+
+    # MCP JSON-RPC format
+    if "jsonrpc" in body:
+        method = body.get("method", "")
+        req_id = body.get("id", 1)
+
+        if method == "initialize":
+            return {
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "ledger-agent", "version": "1.0.0"}
+                }
+            }
+
+        if method == "tools/list":
+            return {
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {"tools": [{
+                    "name": "answer_question",
+                    "description": "Answer questions about Acme Appliances order ledger",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"question": {"type": "string"}},
+                        "required": ["question"]
+                    }
+                }]}
+            }
+
+        if method == "tools/call":
+            params = body.get("params", {})
+            args = params.get("arguments", params.get("input", {}))
+            question = args.get("question", "")
+            result = get_answer(question)
+            return {
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": str(result)}],
+                    "isError": False
+                }
+            }
+
+        return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": "Method not found"}}
+
+    # Plain REST format
+    question = body.get("question", "")
+    result = get_answer(question)
     return {"answer": result}
