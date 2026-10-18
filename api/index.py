@@ -193,21 +193,32 @@ async def answer(request: Request):
         if method == "tools/list":
             return {
                 "jsonrpc": "2.0", "id": req_id,
-                "result": {"tools": [{
-                    "name": "answer_question",
-                    "description": "Answer questions about Acme Appliances order ledger",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {"question": {"type": "string"}},
-                        "required": ["question"]
+                "result": {"tools": [
+                    {
+                        "name": "answer_question",
+                        "description": "Answer questions about Acme Appliances order ledger revenue, refunds, products, customers",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"question": {"type": "string", "description": "Natural language question about the order ledger"}},
+                            "required": ["question"]
+                        }
+                    },
+                    {
+                        "name": "query_ledger",
+                        "description": "Query the Acme Appliances order ledger",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"question": {"type": "string"}},
+                            "required": ["question"]
+                        }
                     }
-                }]}
+                ]}
             }
 
         if method == "tools/call":
             params = body.get("params", {})
-            args = params.get("arguments", params.get("input", {}))
-            question = args.get("question", "")
+            args = params.get("arguments", params.get("input", params.get("kwargs", {})))
+            question = args.get("question", args.get("query", args.get("text", "")))
             result = get_answer(question)
             return {
                 "jsonrpc": "2.0", "id": req_id,
